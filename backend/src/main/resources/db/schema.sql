@@ -46,3 +46,15 @@ CREATE TABLE IF NOT EXISTS reconocimiento.ensayo_facial (
  registro_version VARCHAR(64) NOT NULL,modelo VARCHAR(80) NOT NULL
 );
 ALTER TABLE reconocimiento.ensayo_facial ADD COLUMN IF NOT EXISTS captura_version VARCHAR(40) NOT NULL DEFAULT 'legacy-v1';
+CREATE TABLE IF NOT EXISTS reconocimiento.usuario (
+ id SMALLINT PRIMARY KEY CHECK(id=1), dni VARCHAR(8) NOT NULL UNIQUE REFERENCES reconocimiento.persona(dni),
+ rol VARCHAR(20) NOT NULL CHECK(rol='ADMINISTRADOR'), clave_dispositivo TEXT NOT NULL
+);
+ALTER TABLE reconocimiento.usuario ADD COLUMN IF NOT EXISTS nombre_usuario VARCHAR(40);
+ALTER TABLE reconocimiento.usuario ADD COLUMN IF NOT EXISTS clave_hash TEXT
+ CONSTRAINT credenciales_administrador_completas CHECK ((nombre_usuario IS NULL) = (clave_hash IS NULL));
+CREATE TABLE IF NOT EXISTS reconocimiento.sesion (
+ token_hash VARCHAR(64) PRIMARY KEY, dni VARCHAR(8) NOT NULL REFERENCES reconocimiento.persona(dni),
+ rol VARCHAR(20) NOT NULL CHECK(rol IN ('ADMINISTRADOR','PERSONA')), vence TIMESTAMP WITH TIME ZONE NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sesion_vence ON reconocimiento.sesion(vence);

@@ -1,6 +1,7 @@
 package com.example.reconocimiento.application;
 
 import com.example.reconocimiento.domain.*;
+import com.example.reconocimiento.domain.AccessModels.AttendanceMark;
 import static com.example.reconocimiento.domain.Models.*;
 import static com.example.reconocimiento.domain.Rules.*;
 import org.springframework.stereotype.Service;
@@ -13,9 +14,14 @@ import java.util.*;
 @Transactional
 public class AttendanceService {
     private final AttendanceStore store;
+    private final AccessStore access;
     private final Clock clock;
     private static final ZoneId LIMA=ZoneId.of("America/Lima");
-    public AttendanceService(AttendanceStore store,Clock clock) {this.store=store;this.clock=clock;}
+    public AttendanceService(AttendanceStore store, AccessStore access, Clock clock) {
+        this.store = store;
+        this.access = access;
+        this.clock = clock;
+    }
     public Configuration configuration(){return store.configuration(false);}
     public Configuration configure(Configuration c){config(c);Configuration current=store.configuration(true);if(c.version()!=null&&!c.version().isBlank())require(current.version().equals(c.version()),"CONFIG_CONFLICTO","La configuración cambió en otro lugar. Actualiza los datos antes de guardar.");store.saveConfiguration(c);return configuration();}
     public List<Person> people(){return store.people();}
@@ -72,7 +78,10 @@ public class AttendanceService {
         else store.updateProfile(dni,normalizedName,updatedPhoto);
         if(Boolean.TRUE.equals(input.eliminarHuella()))store.unbind(dni);
         if(fingerprint!=null){store.unbind(dni);store.bind(new Device(deviceId(fingerprint.clave()),dni,fingerprint.clave()));store.consume(fingerprint.id());}
-        return active(dni);
+        Person updated = active(dni);
+        requireAdministratorMethod(updated);
+        if (input.vectores() != null || fingerprint != null || Boolean.TRUE.equals(input.eliminarHuella())) access.revokeSessions(dni);
+        return updated;
     }
     private Challenge bindingProof(Proof proof,String dni,String purpose,String ip){
         Challenge c=validChallenge(proof.reto(),ip);
@@ -87,9 +96,29 @@ public class AttendanceService {
         signature(c,proof.firma());return c;
     }
     public boolean requiresFace(Challenge c){return c.proposito().equals("EDITAR_HUELLA")&&active(c.dni()).rostro()&&store.device(deviceId(c.clave()))==null;}
-    public Person replace(String dni,Enrollment input){store.configuration(true);active(dni);require(input!=null&&dni.equals(input.dni()),"DNI_INVALIDO","El DNI no se puede cambiar.");require(input.vectores()!=null,"CAPTURAS_INSUFICIENTES","Registra entre tres y cinco capturas del rostro.");Enrollment e=validate(input);store.replaceFaces(e);return active(dni);}
-    public void remove(String dni){active(dni);store.deletePerson(dni);}
-    public void unbindPerson(String dni){active(dni);store.unbind(dni);}
+    public Person replace(String dni,Enrollment input){store.configuration(true);active(dni);require(input!=null&&dni.equals(input.dni()),"DNI_INVALIDO","El DNI no se puede cambiar.");require(input.vectores()!=null,"CAPTURAS_INSUFICIENTES","Registra entre tres y cinco capturas del rostro.");Enrollment e=validate(input);store.replaceFaces(e);access.revokeSessions(dni);return active(dni);}
+    public void remove(String dni) {
+        store.configuration(true);
+        active(dni);
+        require(!isAdministrator(dni), "ADMINISTRADOR_ACTIVO", "La ficha del administrador debe permanecer activa.");
+        access.revokeSessions(dni);
+        store.deletePerson(dni);
+    }
+    public void unbindPerson(String dni) {
+        store.configuration(true);
+        active(dni);
+        store.unbind(dni);
+        requireAdministratorMethod(active(dni));
+        access.revokeSessions(dni);
+    }
+    private boolean isAdministrator(String dni) {
+        var administrator = access.administrator();
+        return administrator != null && administrator.dni().equals(dni);
+    }
+    private void requireAdministratorMethod(Person person) {
+        require(person.rostro() || person.huella() || !isAdministrator(person.dni()),
+                "BIOMETRIA_REQUERIDA", "El administrador debe conservar el rostro o la huella vinculada.");
+    }
     public Device device(String key){String id=deviceId(key);Device d=store.device(id);require(d!=null,"DISPOSITIVO_SIN_VINCULAR","No hay una persona activa vinculada a este teléfono. No existe, fue eliminada o falta vincularla desde Personas.");active(d.dni());Device current=store.device(id);require(current!=null&&current.dni().equals(d.dni())&&current.clave().equals(key),"DISPOSITIVO_REVOCADO","La vinculación del teléfono cambió. Vuelve a registrar la huella desde su ficha.");return current;}
     public Challenge challenge(ChallengeRequest request,String ip){
         require(request!=null&&request.proposito()!=null&&Set.of("FACIAL","HUELLA","VINCULAR","ALTA_HUELLA","EDITAR_HUELLA").contains(request.proposito()),"RETO_INVALIDO","La operación no es válida.");
@@ -125,6 +154,12 @@ public class AttendanceService {
         signature(c,proof.firma());store.bind(new Device(deviceId(c.clave()),p.dni(),c.clave()));store.consume(c.id());return active(p.dni());
     }
     public Attendance mark(Proof proof,String ip){
+        return mark(proof, ip, false).asistencia();
+    }
+    public AttendanceMark markForReceipt(Proof proof, String ip) {
+        return mark(proof, ip, true);
+    }
+    private AttendanceMark mark(Proof proof, String ip, boolean includeExisting) {
         Challenge c=validChallenge(proof.reto(),ip);require(Set.of("FACIAL","HUELLA").contains(c.proposito()),"RETO_INVALIDO","La solicitud no corresponde a una asistencia.");
         Configuration cfg=store.configuration(true);require(cfg.revision()==c.revision(),"CONFIG_CAMBIO","La zona cambió durante la verificación. Intenta nuevamente.");
         double dist=zone(cfg,c.ubicacion(),Duration.between(c.creado(),clock.instant()).toMillis(),ip);
@@ -136,10 +171,21 @@ public class AttendanceService {
         if(score!=null){captured=proof.foto()==null?"":proof.foto();photo(captured);reference=store.facePhoto(dni);if(!reference.isBlank())referenceType="GALERIA".equals(p.origenRostro())?"GALERIA":"ROSTRO";else reference=p.foto();}
         Instant markedAt=clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
         validateAge(c,markedAt);dist=zone(cfg,c.ubicacion(),Duration.between(c.creado(),markedAt).toMillis(),ip);
-        LocalDate date=markedAt.atZone(LIMA).toLocalDate();require(!store.attended(dni,date),"YA_MARCO","Esta persona ya marcó su asistencia hoy.");
-        Attendance result=store.insertAttendance(new Attendance(0,dni,p.nombre(),date,markedAt,c.proposito(),dist,c.ubicacion().precision(),ip,score,captured,reference,score==null?null:cfg.umbral(),referenceType));store.consume(c.id());return result;
+        LocalDate date = markedAt.atZone(LIMA).toLocalDate();
+        if (store.attended(dni, date)) {
+            require(includeExisting, "YA_MARCO", "Esta persona ya marcó su asistencia hoy.");
+            Attendance existing = store.attendance(date, dni).getFirst();
+            store.consume(c.id());
+            return new AttendanceMark(existing, p, true);
+        }
+        Attendance result = store.insertAttendance(new Attendance(0,dni,p.nombre(),date,markedAt,c.proposito(),dist,c.ubicacion().precision(),ip,score,captured,reference,score==null?null:cfg.umbral(),referenceType));
+        store.consume(c.id());
+        return new AttendanceMark(result, p, false);
     }
     public List<Attendance> attendance(LocalDate date){return store.attendance(date==null?LocalDate.now(clock.withZone(LIMA)):date);}
+    public List<Attendance> attendance(LocalDate date, String dni) {
+        return store.attendance(date == null ? LocalDate.now(clock.withZone(LIMA)) : date, dni);
+    }
     public List<Attendance> report(LocalDate from,LocalDate to){
         require((from==null)==(to==null),"PERIODO_INVALIDO","Selecciona las dos fechas del reporte.");
         if(from!=null)require(!from.isAfter(to)&&from.getYear()>=1900&&!to.isAfter(LocalDate.now(clock.withZone(LIMA))),"PERIODO_INVALIDO","Elige un período válido, sin fechas futuras.");

@@ -42,9 +42,10 @@ class GalleryFaceEnrollment(private val context: Context) {
             } finally {aligned.recycle()}
         } finally {detector.close()}
     }
-    private fun jpeg(bitmap: Bitmap): String {
-        val output=ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG,88,output)
-        return Base64.encodeToString(output.toByteArray(),Base64.NO_WRAP)
-    }
+}
+
+internal fun jpeg(bitmap: Bitmap): String {
+    val output = ByteArrayOutputStream()
+    if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 88, output)) throw AppFailure("No se pudo preparar la foto.")
+    return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
 }

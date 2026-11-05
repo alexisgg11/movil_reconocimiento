@@ -54,6 +54,9 @@ fun PeopleScreen(state: AppState, onNew: () -> Unit, onView: (Person) -> Unit,
                                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
                                     Text(person.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                                     Text("DNI ${person.dni}", style = MaterialTheme.typography.bodyMedium, color = MutedBlue)
+                                    if (state.isAdministrator && state.session?.dni == person.dni) {
+                                        Text("Administrador", style = MaterialTheme.typography.labelMedium, color = DeepBlue)
+                                    }
                                     Row(horizontalArrangement=Arrangement.spacedBy(5.dp),verticalAlignment=Alignment.CenterVertically) {
                                         val pending=!person.face||!person.fingerprint
                                         val color=if(!person.face&&!person.fingerprint) MaterialTheme.colorScheme.error else if(pending) Color(0xFF996000) else MaterialTheme.colorScheme.primary
@@ -73,7 +76,9 @@ fun PeopleScreen(state: AppState, onNew: () -> Unit, onView: (Person) -> Unit,
                         Row(Modifier.fillMaxWidth()) {
                             PersonAction(Symbol.Eye, "Ver ficha", !state.loading, { onView(person) }, Modifier.weight(1f))
                             PersonAction(Symbol.Edit, "Editar persona", !state.loading, { onEdit(person) }, Modifier.weight(1f).testTag("editar-${person.dni}"))
-                            PersonAction(Symbol.Delete, "Eliminar persona", !state.loading, { onDelete(person) }, Modifier.weight(1f))
+                            if (state.session?.dni != person.dni) {
+                                PersonAction(Symbol.Delete, "Eliminar persona", !state.loading, { onDelete(person) }, Modifier.weight(1f))
+                            }
                         }
                     }
                 }

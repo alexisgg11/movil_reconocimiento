@@ -18,6 +18,7 @@ public interface AttendanceStore {
     List<Template> templates();
     void insertChallenge(Challenge c);
     Challenge challenge(String id);
+    Challenge loginChallenge(String id);
     void consume(String id);
     Device device(String id);
     void bind(Device d);
@@ -25,6 +26,7 @@ public interface AttendanceStore {
     boolean attended(String dni,LocalDate date);
     Attendance insertAttendance(Attendance a);
     List<Attendance> attendance(LocalDate date);
+    List<Attendance> attendance(LocalDate date, String dni);
     List<Attendance> report(LocalDate from,LocalDate to);
     void insertTrial(FaceTrial trial);
     TrialSummary trialSummary(String galleryVersion,double threshold,String capturePolicy);

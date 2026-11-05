@@ -15,6 +15,7 @@ import android.graphics.Bitmap
 import android.util.Base64
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.time.Instant
 
 class AttendanceUiTest {
     @get:Rule val compose=createComposeRule()
@@ -30,15 +31,100 @@ class AttendanceUiTest {
         override suspend fun challenge(purpose: String,position: Position?,publicKey: String?,dni: String?)=error("Sin autenticación en pruebas de presentación")
         override suspend fun bind(challenge: Challenge,signature: String,capture: FaceCapture){}
         override suspend fun mark(challenge: Challenge,signature: String?,capture: FaceCapture?)=error("Sin marcación en pruebas de presentación")
+        override fun activateReceipt(access: PersonalAccess) {}
     })
-    private fun show() {
+    private fun show(administrator: Boolean = true, access: AccessCallbacks? = null, facial: () -> Unit = {}) {
+        if (administrator) vm.change { it.copy(session = AccessSession("00000001", AccessRole.ADMINISTRADOR, Instant.MAX)) }
         compose.setContent {
             ReconocimientoTheme {
                 val state by vm.state.collectAsState()
-                ReconocimientoApp(state,vm,{},{},{},{},{},{},{},{},{},{},{},
-                    networkInfo={it(NetworkInfo("127.0.0.1","192.168.1.45"))},selectDate={date->vm.change {it.copy(attendanceDate=date,followToday=date==attendanceToday(),attendance=emptyList())}})
+                ReconocimientoApp(state,vm,{},{},{},{},{},{},facial,{},{},{},{},
+                    networkInfo={it(NetworkInfo("127.0.0.1","192.168.1.45"))},selectDate={date->vm.change {it.copy(attendanceDate=date,followToday=date==attendanceToday(),attendance=emptyList())}},
+                    access = access)
             }
         }
+    }
+    private fun accessCallbacks(
+        login: (AccessMethod) -> Unit = { error("La marcación no inicia sesión administrativa.") },
+        credentials: (String, String) -> Unit = { _, _ -> error("Acceso inesperado por contraseña.") }
+    ) = AccessCallbacks(login, credentials, vm::endSession, vm::openReceiptProfile, {}, { _, _, _ -> }, { _, _, _, _, _ -> })
+
+    @Test fun guestMarksOnceAndPersonalSessionShowsOnlyOwnOptions() {
+        vm.change { it.copy(accessStatus = AccessStatus(administratorCreated = true), publicZone = PublicZone(configured = true)) }
+        val profile = Person("12345678", "Persona de prueba", "", true, true)
+        var biometricChecks = 0
+        show(administrator = false, access = accessCallbacks(), facial = {
+            biometricChecks++
+            val entry = Attendance(profile.name, profile.dni, "2026-11-01T02:20:30Z", "FACIAL", 8.0, .93)
+            vm.change { it.copy(markingReceipt = MarkingResult(entry,
+                PersonalAccess(profile, AccessSession(profile.dni, AccessRole.PERSONA, Instant.MAX), false))) }
+        })
+        compose.onNodeWithTag("pantalla-login").assertExists()
+        compose.onNodeWithTag("marcar-facial").assertDoesNotExist()
+        compose.onNodeWithTag("entrar-asistencia").performClick()
+        compose.onNodeWithTag("marcar-facial").assertExists()
+        compose.onNodeWithTag("nav-0").assertDoesNotExist()
+        compose.onNodeWithTag("nav-2").assertDoesNotExist()
+        compose.onNodeWithTag("nav-3").assertDoesNotExist()
+        compose.onNodeWithTag("marcar-facial").performClick()
+        compose.onNodeWithText("Asistencia registrada").assertExists()
+        compose.onNodeWithText("21:20 · Rostro").assertExists()
+        compose.onNodeWithTag("abrir-ficha-recibo").performClick()
+        compose.runOnIdle { org.junit.Assert.assertEquals(1, biometricChecks) }
+        compose.onNodeWithTag("nav-0").assertDoesNotExist()
+        compose.onNodeWithTag("nav-2").assertDoesNotExist()
+        compose.onNodeWithText(profile.name).assertExists()
+        compose.onNodeWithText("Editar mis datos").performClick()
+        compose.onNodeWithText("Editar mi ficha").assertExists()
+        compose.onNodeWithTag("capturar-rostro").assertDoesNotExist()
+        compose.onNodeWithText("Cancelar").performClick()
+        compose.onNodeWithContentDescription("Cerrar sesión").performClick()
+        compose.onNodeWithText("Cerrar sesión").performClick()
+        compose.onNodeWithText(profile.name).assertDoesNotExist()
+        compose.onNodeWithTag("marcar-facial").assertExists()
+        compose.onNodeWithTag("nav-3").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Volver al inicio").performClick()
+        compose.onNodeWithTag("pantalla-login").assertExists()
+    }
+
+    @Test fun administratorLoginOpensManagementAfterBiometricConfirmation() {
+        vm.change { it.copy(accessStatus = AccessStatus(administratorCreated = true)) }
+        val callbacks = accessCallbacks(login = { method ->
+            org.junit.Assert.assertEquals(AccessMethod.HUELLA, method)
+            vm.startSession(AccessSession("12345678", AccessRole.ADMINISTRADOR, Instant.MAX))
+        })
+        show(administrator = false, access = callbacks)
+        compose.onNodeWithTag("pantalla-login").assertExists()
+        compose.onNodeWithTag("nav-0").assertDoesNotExist()
+        compose.onNodeWithTag("acceso-huella").assertIsEnabled()
+        compose.onNodeWithTag("dni-acceso").assertDoesNotExist()
+        compose.onNodeWithText("Mi ficha").assertDoesNotExist()
+        screenshot("login-simple")
+        compose.onNodeWithTag("acceso-huella").performClick()
+        compose.onNodeWithTag("pantalla-login").assertDoesNotExist()
+        compose.onNodeWithTag("nav-0").assertIsSelected()
+        compose.onNodeWithTag("nav-2").assertExists()
+        compose.onNodeWithContentDescription("Cerrar sesión").performClick()
+        compose.onNodeWithText("¿Cerrar sesión?").assertIsDisplayed()
+        compose.onNodeWithTag("cancelar-confirmacion").performClick()
+        compose.onNodeWithTag("nav-0").assertIsSelected()
+        compose.onNodeWithContentDescription("Cerrar sesión").performClick()
+        compose.onNodeWithText("Cerrar sesión").performClick()
+        compose.onNodeWithTag("pantalla-login").assertExists()
+    }
+
+    @Test fun administratorCanUseUsernameAndPassword() {
+        vm.change { it.copy(accessStatus = AccessStatus(administratorCreated = true)) }
+        show(administrator = false, access = accessCallbacks(credentials = { username, password ->
+            org.junit.Assert.assertEquals("operador.qa", username)
+            org.junit.Assert.assertEquals("contraseña de prueba", password)
+            vm.startSession(AccessSession("12345678", AccessRole.ADMINISTRADOR, Instant.MAX))
+        }))
+        compose.onNodeWithTag("ingresar-credenciales").assertIsNotEnabled()
+        compose.onNodeWithTag("usuario-acceso").performTextInput("operador.qa")
+        compose.onNodeWithTag("clave-acceso").performTextInput("contraseña de prueba")
+        compose.onNodeWithTag("ingresar-credenciales").performScrollTo().performClick()
+        compose.onNodeWithTag("nav-0").assertIsSelected()
     }
     @Test fun tappingFacialAttendanceShowsIdentityScoreAndLimaTime() {
         vm.change {it.copy(attendanceDate="2026-10-31",followToday=false,attendance=listOf(Attendance("Ana Pérez","12345678","2026-11-01T02:20:30Z","FACIAL",8.0,.9345,12,threshold=.8,accuracy=5.0,ip="127.0.0.1")))}

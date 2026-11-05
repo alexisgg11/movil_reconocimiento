@@ -44,6 +44,23 @@ data class PersonChange(val dni: String,val name: String,val photo: String,val c
                         val fingerprint: FingerprintProof?=null,val removeFingerprint: Boolean=false,val original: Person?=null)
 
 interface AttendanceRepository {
+    suspend fun accessStatus(): AccessStatus = AccessStatus()
+    suspend fun publicZone(): PublicZone = PublicZone()
+    suspend fun loginChallenge(method: AccessMethod, publicKey: String): Challenge =
+        throw AppFailure("El acceso biométrico no está disponible.")
+    suspend fun login(challenge: Challenge, signature: String?, capture: FaceCapture?): AccessSession =
+        throw AppFailure("El acceso biométrico no está disponible.")
+    suspend fun loginWithCredentials(username: String, password: String): AccessSession =
+        throw AppFailure("El acceso con contraseña no está disponible.")
+    suspend fun logout() = clearSession()
+    fun clearSession() {}
+    suspend fun ownProfile(): Person = throw AppFailure("No se pudo consultar tu ficha.")
+    suspend fun saveOwnProfile(change: PersonChange): Person = throw AppFailure("No se pudo guardar tu ficha.")
+    suspend fun initialFingerprint(code: String, dni: String, publicKey: String): Challenge =
+        throw AppFailure("La preparación del administrador no está disponible.")
+    suspend fun prepareAdministrator(code: String, dni: String, deviceKey: String, enrollment: PersonChange?,
+                                     username: String, password: String): Unit =
+        throw AppFailure("La preparación del administrador no está disponible.")
     suspend fun people(): List<Person>
     suspend fun ensureDniAvailable(dni: String) {
         if(people().any {it.dni==dni})throw AppFailure("Ese DNI ya está registrado. Abre su ficha para editarlo.","DNI_DUPLICADO")
@@ -64,4 +81,8 @@ interface AttendanceRepository {
     suspend fun challenge(purpose: String, position: Position? = null, publicKey: String? = null, dni: String? = null): Challenge
     suspend fun bind(challenge: Challenge, signature: String, capture: FaceCapture)
     suspend fun mark(challenge: Challenge, signature: String? = null, capture: FaceCapture? = null): Attendance
+    suspend fun markForResult(challenge: Challenge, signature: String? = null, capture: FaceCapture? = null): MarkingResult =
+        MarkingResult(mark(challenge, signature, capture))
+    fun activateReceipt(access: PersonalAccess): Unit = throw AppFailure("La verificación venció. Vuelve a marcar.")
+    fun discardReceipt() {}
 }

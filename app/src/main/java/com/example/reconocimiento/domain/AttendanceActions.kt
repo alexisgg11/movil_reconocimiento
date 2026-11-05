@@ -12,7 +12,7 @@ enum class AttendanceStage { LOCATION, FACE_CAPTURE, FACE_COMPARE, FINGERPRINT }
 
 class AttendanceActions(private val repository: AttendanceRepository,private val device: DeviceOperations,
                         private val stage: (AttendanceStage)->Unit = {}) {
-    suspend fun markFacial(): Attendance {
+    suspend fun markFacial(): MarkingResult {
         stage(AttendanceStage.LOCATION)
         repository.challenge("FACIAL",device.currentPosition())
         stage(AttendanceStage.FACE_CAPTURE)
@@ -20,14 +20,14 @@ class AttendanceActions(private val repository: AttendanceRepository,private val
         stage(AttendanceStage.LOCATION)
         val challenge=repository.challenge("FACIAL",device.currentPosition())
         stage(AttendanceStage.FACE_COMPARE)
-        return repository.mark(challenge,capture=capture)
+        return repository.markForResult(challenge,capture=capture)
     }
-    suspend fun markFingerprint(): Attendance {
+    suspend fun markFingerprint(): MarkingResult {
         stage(AttendanceStage.LOCATION)
         val key=device.publicKey()
         val challenge=repository.challenge("HUELLA",device.currentPosition(),key)
         stage(AttendanceStage.FINGERPRINT)
-        return repository.mark(challenge,signature=device.sign(challenge))
+        return repository.markForResult(challenge,signature=device.sign(challenge))
     }
     suspend fun bind(person: Person) {
         val key=device.publicKey()

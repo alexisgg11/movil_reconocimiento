@@ -6,6 +6,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -15,7 +16,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 
-enum class Symbol { Info, Import, Download, ChevronLeft, Calendar, Network, Warning, Clock, Settings, Fingerprint, Search, Person, Eye, Edit, Delete, Phone, Mail, Location, Camera, Attach, Plus, Close, Check, ChevronRight, ChevronDown, Briefcase, Home, IdCard }
+enum class Symbol { Info, Import, Download, ChevronLeft, Calendar, Network, Warning, Clock, Settings, Fingerprint, Search, Person, Eye, Edit, Delete, Phone, Mail, Location, Camera, Attach, Plus, Close, Logout, Check, ChevronRight, ChevronDown, Briefcase, Home, IdCard, Refresh }
 
 @Composable
 fun AppIcon(symbol: Symbol, modifier: Modifier = Modifier, color: Color = MaterialTheme.colorScheme.primary, description: String? = null) {
@@ -27,6 +28,10 @@ fun AppIcon(symbol: Symbol, modifier: Modifier = Modifier, color: Color = Materi
                 drawPath(Path().apply { moveTo(points[0], points[1]); for (i in 2 until points.size step 2) lineTo(points[i], points[i + 1]) }, color, style = stroke)
             }
             when (symbol) {
+                Symbol.Refresh -> {
+                    drawArc(color, 35f, 290f, false, Offset(4f,4f), Size(16f,16f), style = stroke)
+                    path(20f,3f,20f,9f,14f,9f)
+                }
                 Symbol.Info -> {drawCircle(color,9f,Offset(12f,12f),style=stroke);line(12f,7f,12f,13f);drawCircle(color,1f,Offset(12f,17f))}
                 Symbol.Import -> {path(14f,3f,21f,3f,21f,21f,3f,21f,3f,15f);path(3f,3f,12f,12f,12f,5f);line(12f,12f,5f,12f)}
                 Symbol.Download -> {path(12f,3f,12f,15f,7f,10f);line(12f,15f,17f,10f);path(3f,16f,3f,21f,21f,21f,21f,16f)}
@@ -46,6 +51,11 @@ fun AppIcon(symbol: Symbol, modifier: Modifier = Modifier, color: Color = Materi
                 }
                 Symbol.Plus -> { line(12f, 4f, 12f, 20f); line(4f, 12f, 20f, 12f) }
                 Symbol.Close -> { line(5f, 5f, 19f, 19f); line(19f, 5f, 5f, 19f) }
+                Symbol.Logout -> {
+                    path(12f, 4f, 4f, 4f, 4f, 20f, 12f, 20f)
+                    line(9f, 12f, 21f, 12f)
+                    path(17f, 8f, 21f, 12f, 17f, 16f)
+                }
                 Symbol.Check -> path(4f, 12f, 9f, 17f, 20f, 6f)
                 Symbol.Eye -> {
                     drawPath(Path().apply { moveTo(2f, 12f); cubicTo(7f, 2f, 17f, 2f, 22f, 12f); cubicTo(17f, 22f, 7f, 22f, 2f, 12f); close() }, color, style = stroke)

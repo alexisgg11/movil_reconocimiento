@@ -49,7 +49,13 @@ public class JdbcAttendanceStore implements AttendanceStore {
         db.update("INSERT INTO reconocimiento.reto(id,nonce,proposito,dni,clave,creado,latitud,longitud,precision_m,edad_ms,ip,revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",c.id(),c.nonce(),c.proposito(),c.dni(),c.clave(),Timestamp.from(c.creado()),p==null?null:p.latitud(),p==null?null:p.longitud(),p==null?null:p.precision(),p==null?null:p.edadMs(),c.ip(),c.revision());
     }
     @Override public Challenge challenge(String id) {
-        List<Challenge> list=db.query("SELECT * FROM reconocimiento.reto WHERE id=? AND usado=FALSE FOR UPDATE",(r,n)->new Challenge(r.getString("id"),r.getString("nonce"),r.getString("proposito"),r.getString("dni"),r.getString("clave"),r.getTimestamp("creado").toInstant(),r.getObject("latitud")==null?null:new Position(r.getDouble("latitud"),r.getDouble("longitud"),r.getDouble("precision_m"),r.getLong("edad_ms"),false),r.getString("ip"),r.getLong("revision")),id);
+        return readChallenge("SELECT * FROM reconocimiento.reto WHERE id=? AND usado=FALSE FOR UPDATE", id);
+    }
+    @Override public Challenge loginChallenge(String id) {
+        return readChallenge("SELECT * FROM reconocimiento.reto WHERE id=? AND usado=FALSE AND LEFT(proposito,6)='LOGIN_' FOR UPDATE", id);
+    }
+    private Challenge readChallenge(String sql, String id) {
+        List<Challenge> list=db.query(sql,(r,n)->new Challenge(r.getString("id"),r.getString("nonce"),r.getString("proposito"),r.getString("dni"),r.getString("clave"),r.getTimestamp("creado").toInstant(),r.getObject("latitud")==null?null:new Position(r.getDouble("latitud"),r.getDouble("longitud"),r.getDouble("precision_m"),r.getLong("edad_ms"),false),r.getString("ip"),r.getLong("revision")),id);
         return list.isEmpty()?null:list.getFirst();
     }
     @Override public void consume(String id) {db.update("UPDATE reconocimiento.reto SET usado=TRUE WHERE id=?",id);}
@@ -63,7 +69,19 @@ public class JdbcAttendanceStore implements AttendanceStore {
             s.setString(1,a.dni());s.setString(2,a.nombre());s.setDate(3,java.sql.Date.valueOf(a.fecha()));s.setTimestamp(4,Timestamp.from(a.instante()));s.setString(5,a.metodo());s.setDouble(6,a.distancia());s.setDouble(7,a.precision());s.setString(8,a.ip());s.setObject(9,a.similitud());s.setString(10,a.foto());s.setString(11,a.fotoRegistro());s.setObject(12,a.umbral());s.setString(13,a.tipoFotoRegistro());return s;},keys);
         return new Attendance(keys.getKey().longValue(),a.dni(),a.nombre(),a.fecha(),a.instante(),a.metodo(),a.distancia(),a.precision(),a.ip(),a.similitud(),a.foto(),a.fotoRegistro(),a.umbral(),a.tipoFotoRegistro());
     }
-    @Override public List<Attendance> attendance(LocalDate date) {return db.query("SELECT * FROM reconocimiento.asistencia WHERE fecha=? ORDER BY instante DESC",(r,n)->new Attendance(r.getLong("id"),r.getString("dni"),r.getString("nombre"),r.getDate("fecha").toLocalDate(),r.getTimestamp("instante").toInstant(),r.getString("metodo"),r.getDouble("distancia"),r.getDouble("precision_m"),r.getString("ip"),(Double)r.getObject("similitud"),r.getString("foto"),r.getString("foto_registro"),(Double)r.getObject("umbral"),r.getString("tipo_foto_registro")),java.sql.Date.valueOf(date));}
+    @Override public List<Attendance> attendance(LocalDate date) {
+        return db.query("SELECT * FROM reconocimiento.asistencia WHERE fecha=? ORDER BY instante DESC", this::mapAttendance, java.sql.Date.valueOf(date));
+    }
+    @Override public List<Attendance> attendance(LocalDate date, String dni) {
+        return db.query("SELECT * FROM reconocimiento.asistencia WHERE fecha=? AND dni=? ORDER BY instante DESC",
+                this::mapAttendance, java.sql.Date.valueOf(date), dni);
+    }
+    private Attendance mapAttendance(ResultSet row, int index) throws SQLException {
+        return new Attendance(row.getLong("id"), row.getString("dni"), row.getString("nombre"), row.getDate("fecha").toLocalDate(),
+                row.getTimestamp("instante").toInstant(), row.getString("metodo"), row.getDouble("distancia"), row.getDouble("precision_m"),
+                row.getString("ip"), (Double)row.getObject("similitud"), row.getString("foto"), row.getString("foto_registro"),
+                (Double)row.getObject("umbral"), row.getString("tipo_foto_registro"));
+    }
     @Override public List<Attendance> report(LocalDate from,LocalDate to) {
         String sql="SELECT id,dni,nombre,fecha,instante,metodo,distancia,precision_m,ip,similitud,umbral,tipo_foto_registro FROM reconocimiento.asistencia";
         if(from!=null)sql+=" WHERE fecha BETWEEN ? AND ?";

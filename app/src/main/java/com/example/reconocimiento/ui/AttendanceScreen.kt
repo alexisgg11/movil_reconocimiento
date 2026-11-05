@@ -21,6 +21,8 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import com.example.reconocimiento.domain.Attendance
+import com.example.reconocimiento.domain.AccessRole
+import com.example.reconocimiento.domain.MarkingResult
 
 private val lima = ZoneId.of("America/Lima")
 private fun hour(value: String) = runCatching {
@@ -35,6 +37,7 @@ fun AttendanceScreen(state: AppState, facial: () -> Unit, fingerprint: () -> Uni
     LazyColumn(Modifier.fillMaxSize().padding(horizontal = 20.dp).testTag("lista-asistencia"), contentPadding = PaddingValues(bottom = 20.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)) {
         item { Text("Asistencia", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold) }
+        if (state.session?.role != AccessRole.PERSONA) {
         item {
             Surface(color = Color.White, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
                 Column(Modifier.fillMaxWidth().padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally,
@@ -48,11 +51,11 @@ fun AttendanceScreen(state: AppState, facial: () -> Unit, fingerprint: () -> Uni
                     Column(Modifier.fillMaxWidth().padding(top = 6.dp),horizontalAlignment=Alignment.CenterHorizontally) {
                         Row(verticalAlignment=Alignment.CenterVertically,horizontalArrangement=Arrangement.spacedBy(6.dp)) {
                             AppIcon(Symbol.Location, color = DeepBlue)
-                            Text(if (state.site.latitude == null) "Zona sin configurar" else state.site.name,
+                            Text(if (state.zoneConfigured) state.zoneName else "Zona sin configurar",
                                 style = MaterialTheme.typography.labelLarge, color = DeepBlue)
                         }
-                        if (state.site.latitude != null) Text("Radio máximo ${state.site.radius.toInt()} m", style = MaterialTheme.typography.bodySmall, color = MutedBlue)
-                        if (state.site.latitude == null) TextButton(configure, enabled = !state.loading) { Text("Configurar") }
+                        if (state.zoneConfigured) Text("Radio máximo ${state.zoneRadius.toInt()} m", style = MaterialTheme.typography.bodySmall, color = MutedBlue)
+                        if (!state.zoneConfigured && state.isAdministrator) TextButton(configure, enabled = !state.loading) { Text("Configurar") }
                     }
                 }
             }
@@ -65,33 +68,56 @@ fun AttendanceScreen(state: AppState, facial: () -> Unit, fingerprint: () -> Uni
                     Modifier.weight(1f).testTag("marcar-huella"))
             }
         }
-        item {
-            Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                SectionTitle("Asistencias", Modifier.weight(1f))
-                SecondaryAction("Reporte",report,Modifier.testTag("abrir-reporte"),!state.loading,icon=Symbol.Download)
-            }
         }
-        item {Column(verticalArrangement=Arrangement.spacedBy(6.dp)){AttendanceDateFilter(state.attendanceDate,!state.loading,selectDate)}}
-        item {Text("${state.attendance.size} ${if(state.attendance.size==1)"marcación" else "marcaciones"}",style=MaterialTheme.typography.labelMedium,color=MutedBlue)}
-        if(state.attendanceError!=null)item {Text(state.attendanceError,color=MaterialTheme.colorScheme.error)}
-        else if (state.attendance.isEmpty()) item {
-            Surface(color = Color.White, shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-                Text(if(state.loading) "Consultando asistencias…" else "No hay asistencias para esta fecha.", Modifier.fillMaxWidth().padding(20.dp), color = MutedBlue, style = MaterialTheme.typography.bodyMedium)
+        if (state.session != null) {
+            item {
+                Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    SectionTitle(if (state.isAdministrator) "Asistencias" else "Mis asistencias", Modifier.weight(1f))
+                    if (state.isAdministrator) SecondaryAction("Reporte", report, Modifier.testTag("abrir-reporte"), !state.loading, icon = Symbol.Download)
+                }
             }
-        }
-        items(state.attendance, key = { it.dni }) { item ->
-            Surface(onClick={ detail(item) }, modifier=Modifier.testTag("asistencia-${item.dni}"),color = Color.White, shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-                Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    AppIcon(if (item.method == "FACIAL") Symbol.Camera else Symbol.Fingerprint)
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(item.name, fontWeight = FontWeight.SemiBold)
-                        Text("DNI ${item.dni}", style = MaterialTheme.typography.bodySmall, color = MutedBlue)
+            item { AttendanceDateFilter(state.attendanceDate, !state.loading, selectDate) }
+            item {
+                val label = if (state.attendance.size == 1) "marcación" else "marcaciones"
+                Text("${state.attendance.size} $label", style = MaterialTheme.typography.labelMedium, color = MutedBlue)
+            }
+            if (state.attendanceError != null) item { Text(state.attendanceError, color = MaterialTheme.colorScheme.error) }
+            else if (state.attendance.isEmpty()) item {
+                Surface(color = Color.White, shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                    Text(if (state.loading) "Consultando asistencias…" else "No hay asistencias para esta fecha.",
+                        Modifier.fillMaxWidth().padding(20.dp), color = MutedBlue, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            items(state.attendance, key = { it.dni }) { entry ->
+                Surface(onClick = { detail(entry) }, modifier = Modifier.testTag("asistencia-${entry.dni}"), color = Color.White,
+                    shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                    Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        AppIcon(if (entry.method == "FACIAL") Symbol.Camera else Symbol.Fingerprint)
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text(entry.name, fontWeight = FontWeight.SemiBold)
+                            Text("DNI ${entry.dni}", style = MaterialTheme.typography.bodySmall, color = MutedBlue)
+                        }
+                        Text(hour(entry.instant), fontWeight = FontWeight.SemiBold, color = DeepBlue)
+                        AppIcon(Symbol.ChevronRight, color = MutedBlue)
                     }
-                    Text(hour(item.instant), fontWeight = FontWeight.SemiBold, color = DeepBlue)
-                    AppIcon(Symbol.ChevronRight,color=MutedBlue)
                 }
             }
         }
+    }
+}
+
+@Composable
+fun MarkingReceiptDialog(result: MarkingResult, loading: Boolean, close: () -> Unit, openProfile: () -> Unit) {
+    val access = result.personalAccess ?: return
+    val entry = result.attendance
+    val method = if (entry.method == "FACIAL") "Rostro" else "Huella"
+    EditorDialog(if (access.alreadyMarked) "Ya marcaste hoy" else "Asistencia registrada", close, !loading,
+        actions = {
+            SecondaryAction("Cerrar", close, enabled = !loading)
+            PrimaryAction("Ver mis datos", openProfile, Modifier.testTag("abrir-ficha-recibo"), enabled = !loading)
+        }) {
+        IdentitySummary(access.profile.photo, access.profile.name, access.profile.dni)
+        Text("${hour(entry.instant)} · $method", style = MaterialTheme.typography.titleMedium, color = DeepBlue)
     }
 }
 

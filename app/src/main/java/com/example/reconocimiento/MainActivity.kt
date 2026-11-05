@@ -99,6 +99,57 @@ class MainActivity : FragmentActivity() {
             AttendanceStage.FINGERPRINT -> "Esperando la huella de la cuenta vinculada…"
         })}}
         fun work(block: suspend ()->String?) { lifecycleScope.launch {vm.work {networkPermission();block()}} }
+        suspend fun showMarking(result: MarkingResult) {
+            if (result.personalAccess != null) {
+                vm.change { it.copy(markingReceipt = result) }
+            } else {
+                vm.returnToToday()
+                vm.change { it.copy(attendanceDetail = result.attendance) }
+                vm.refresh()
+            }
+        }
+        val access = AccessCallbacks(
+            login = { method -> work {
+                val key = if (method == AccessMethod.HUELLA) biometrics.publicKey() else biometrics.administratorDeviceKey()
+                val challenge = vm.repository.loginChallenge(method, key)
+                val session = when (method) {
+                    AccessMethod.HUELLA -> vm.repository.login(challenge, biometrics.sign(challenge), null)
+                    AccessMethod.ROSTRO -> {
+                        val captured = operations.captureFace(FaceCaptureMode.VERIFICATION)
+                        val signature = biometrics.signAdministratorDevice(challenge)
+                        vm.repository.login(challenge, signature, captured)
+                    }
+                }
+                vm.startSession(session)
+                vm.refresh()
+                null
+            } },
+            loginWithCredentials = { username, password -> work {
+                vm.startSession(vm.repository.loginWithCredentials(username, password))
+                vm.refresh()
+                null
+            } },
+            logout = { lifecycleScope.launch { vm.work {
+                try { vm.repository.logout() } finally { vm.endSession() }
+                null
+            } } },
+            openReceiptProfile = { work {
+                vm.openReceiptProfile()
+                vm.refresh()
+                null
+            } },
+            captureAdministrator = { accept -> work { accept(operations.captureFace(FaceCaptureMode.ENROLLMENT)); null } },
+            linkInitialFingerprint = { code, dni, accept -> work {
+                val challenge = vm.repository.initialFingerprint(code, dni, biometrics.publicKey())
+                accept(FingerprintProof(challenge, biometrics.sign(challenge)))
+                null
+            } },
+            prepare = { code, dni, enrollment, username, password -> work {
+                vm.repository.prepareAdministrator(code, dni, biometrics.administratorDeviceKey(), enrollment, username, password)
+                vm.change { it.copy(setupOpen = false, accessStatus = it.accessStatus.copy(administratorCreated = true)) }
+                "Acceso configurado. Ya puedes iniciar sesión."
+            } }
+        )
         setContent {
             ReconocimientoTheme {
                 val state by vm.state.collectAsStateWithLifecycle()
@@ -117,8 +168,13 @@ class MainActivity : FragmentActivity() {
                                     cropped.await()?.let {photo->
                                         cropSource=null;cropResult=null
                                         try {
-                                            vm.change {it.copy(activity="Validando foto y comprobando duplicados…")}
-                                            vm.acceptFace(GalleryFaceEnrollment(applicationContext).prepare(photo,true))
+                                            if (vm.state.value.session?.role == AccessRole.PERSONA) {
+                                                val encoded = withContext(Dispatchers.Default) { jpeg(photo) }
+                                                vm.draft { it.copy(photo = encoded) }
+                                            } else {
+                                                vm.change {it.copy(activity="Validando foto y comprobando duplicados…")}
+                                                vm.acceptFace(GalleryFaceEnrollment(applicationContext).prepare(photo,true))
+                                            }
                                         } finally {photo.recycle()}
                                     }
                                 } finally {cropSource=null;cropResult=null}
@@ -130,8 +186,8 @@ class MainActivity : FragmentActivity() {
                     save={work {vm.savePerson()}},
                     delete={person->work {vm.repository.delete(person.dni);vm.change {it.copy(detail=null)};vm.refresh();"Persona eliminada. Ya no podrá marcar asistencia."}},
                     prepareFingerprint={work {val target=vm.fingerprintTarget();vm.fingerprintPrepared(actions.prepareFingerprint(target.dni,target.original));null}},
-                    facial={work {vm.change {it.copy(activity="Verificando ubicación y rostro…")};val attendance=actions.markFacial();vm.returnToToday();vm.refresh();vm.change {it.copy(attendanceDetail=attendance)};null}},
-                    fingerprint={work {vm.change {it.copy(activity="Verificando la cuenta vinculada…")};val attendance=actions.markFingerprint();vm.returnToToday();vm.refresh();vm.change {it.copy(attendanceDetail=attendance)};null}},
+                    facial={work {showMarking(actions.markFacial());null}},
+                    fingerprint={work {showMarking(actions.markFingerprint());null}},
                     selectDate={date->work {vm.selectAttendanceDate(date);null}},
                     downloadReport={from,to->work {
                         vm.change {it.copy(activity="Preparando reporte Excel…")}
@@ -148,6 +204,7 @@ class MainActivity : FragmentActivity() {
                     checkLocation={work {val result=vm.repository.checkZone(operations.currentPosition());vm.change {it.copy(zoneCheck=result)};null}},
                     openCalibration={work {vm.change {it.copy(calibrationOpen=true,trialResult=null)};val summary=vm.repository.trialSummary();vm.change {it.copy(trialSummary=summary)};null}},
                     testFace={expected->work {val capture=operations.captureFace(FaceCaptureMode.VERIFICATION);vm.change {it.copy(activity="Comparando rostro de prueba…")};val result=vm.repository.testFace(capture,expected);vm.change {it.copy(trialResult=result,trialSummary=result.summary)};null}},
+                    access = access,
                     sensorSettings={
                         val intent=if(Build.VERSION.SDK_INT>=30)Intent(Settings.ACTION_BIOMETRIC_ENROLL)
                             .putExtra(Settings.EXTRA_BIOMETRIC_AUTHENTICATORS_ALLOWED,androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)

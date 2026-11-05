@@ -1,4 +1,4 @@
-param([string]$ApiBase='http://127.0.0.1:8082/api')
+param([string]$ApiBase='http://127.0.0.1:8082/api',[SecureString]$AdminToken)
 $ErrorActionPreference='Stop'
 $taskRoot=Split-Path $PSScriptRoot -Parent
 $auditConfig=@{}
@@ -48,32 +48,38 @@ try {
     if($LASTEXITCODE -ne 0){throw 'No se pudo ejecutar la auditoría de lectura en PostgreSQL.'}
     $snapshot=($snapshotText -join "`n") | ConvertFrom-Json
 } finally {$env:PGPASSWORD=$previousPassword}
-$apiPeople=Invoke-RestMethod "$ApiBase/personas"
-$apiPeople=@($apiPeople | ForEach-Object {$_})
-$apiSite=Invoke-RestMethod "$ApiBase/configuracion"
-$peopleMatch=$apiPeople.Count -eq @($snapshot.personas).Count
-$peopleByDni=@{};foreach($person in $apiPeople){$peopleByDni[$person.dni]=$person}
-foreach($person in $snapshot.personas){
-    $remote=$peopleByDni[$person.dni]
-    if($null -eq $remote){$peopleMatch=$false;continue}
-    foreach($field in @('dni','nombre','foto','rostro','huella','origenRostro')){if($person.$field -cne $remote.$field){$peopleMatch=$false}}
-}
-$siteMatch=$true
-foreach($field in @('nombre','latitud','longitud','radio','red','umbral','revision')){if($snapshot.configuracion.$field -ne $apiSite.$field){$siteMatch=$false}}
 $days=@($snapshot.asistencias | Group-Object fecha | Sort-Object Name)
-$attendanceMatch=$true
-foreach($day in $days){
-    $remoteRows=Invoke-RestMethod "$ApiBase/asistencias?fecha=$($day.Name)"
-    $remoteRows=@($remoteRows | ForEach-Object {$_})
-    if($remoteRows.Count -ne $day.Count){$attendanceMatch=$false}
-    $remoteById=@{};foreach($row in $remoteRows){$remoteById[[string]$row.id]=$row}
-    foreach($row in $day.Group){
-        $remote=$remoteById[[string]$row.id]
-        if($null -eq $remote){$attendanceMatch=$false;continue}
-        foreach($field in @('id','dni','nombre','fecha','metodo','distancia','precision','ip','similitud','umbral','foto','fotoRegistro','tipoFotoRegistro')){
-            if($row.$field -cne $remote.$field){$attendanceMatch=$false}
+$peopleMatch=$null
+$siteMatch=$null
+$attendanceMatch=$null
+if ($null -ne $AdminToken) {
+    $headers=@{Authorization='Bearer '+[System.Net.NetworkCredential]::new('', $AdminToken).Password}
+    $apiPeople=Invoke-RestMethod "$ApiBase/personas" -Headers $headers
+    $apiPeople=@($apiPeople | ForEach-Object {$_})
+    $apiSite=Invoke-RestMethod "$ApiBase/configuracion" -Headers $headers
+    $peopleMatch=$apiPeople.Count -eq @($snapshot.personas).Count
+    $peopleByDni=@{};foreach($person in $apiPeople){$peopleByDni[$person.dni]=$person}
+    foreach($person in $snapshot.personas){
+        $remote=$peopleByDni[$person.dni]
+        if($null -eq $remote){$peopleMatch=$false;continue}
+        foreach($field in @('dni','nombre','foto','rostro','huella','origenRostro')){if($person.$field -cne $remote.$field){$peopleMatch=$false}}
+    }
+    $siteMatch=$true
+    foreach($field in @('nombre','latitud','longitud','radio','red','umbral','revision')){if($snapshot.configuracion.$field -ne $apiSite.$field){$siteMatch=$false}}
+    $attendanceMatch=$true
+    foreach($day in $days){
+        $remoteRows=Invoke-RestMethod "$ApiBase/asistencias?fecha=$($day.Name)" -Headers $headers
+        $remoteRows=@($remoteRows | ForEach-Object {$_})
+        if($remoteRows.Count -ne $day.Count){$attendanceMatch=$false}
+        $remoteById=@{};foreach($row in $remoteRows){$remoteById[[string]$row.id]=$row}
+        foreach($row in $day.Group){
+            $remote=$remoteById[[string]$row.id]
+            if($null -eq $remote){$attendanceMatch=$false;continue}
+            foreach($field in @('id','dni','nombre','fecha','metodo','distancia','precision','ip','similitud','umbral','foto','fotoRegistro','tipoFotoRegistro')){
+                if($row.$field -cne $remote.$field){$attendanceMatch=$false}
+            }
+            if(([DateTimeOffset]$row.instante).UtcDateTime.Ticks -ne ([DateTimeOffset]$remote.instante).UtcDateTime.Ticks){$attendanceMatch=$false}
         }
-        if(([DateTimeOffset]$row.instante).UtcDateTime.Ticks -ne ([DateTimeOffset]$remote.instante).UtcDateTime.Ticks){$attendanceMatch=$false}
     }
 }
 $invalidVectors=0
@@ -90,9 +96,10 @@ $report=[ordered]@{
     verificadoUtc=[DateTime]::UtcNow.ToString('o');soloLectura=$true
     personasActivas=@($snapshot.personas).Count;asistencias=@($snapshot.asistencias).Count
     fechasConsultadas=@($days | ForEach-Object {$_.Name});plantillasFaciales=@($snapshot.vectores).Count;ensayosFaciales=$snapshot.ensayosFaciales
+    comparacionApi=($null -ne $AdminToken)
     personasApiCoinciden=$peopleMatch;configuracionApiCoincide=$siteMatch;historialApiCoincide=$attendanceMatch
     plantillasInvalidas=$invalidVectors;controles=$snapshot.controles
-    correcto=($peopleMatch-and$siteMatch-and$attendanceMatch-and$invalidVectors-eq 0-and$invalidControls-eq 0)
+    correcto=((($null -eq $AdminToken) -or ($peopleMatch -and $siteMatch -and $attendanceMatch)) -and $invalidVectors -eq 0 -and $invalidControls -eq 0)
 }
 $json=$report | ConvertTo-Json -Depth 5
 $destination=Join-Path $taskRoot '.local/storage-audit.json'

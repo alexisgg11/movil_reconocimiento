@@ -7,6 +7,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.time.LocalDate
+import java.time.Instant
 import java.time.ZoneId
 
 fun attendanceToday(): String=LocalDate.now(ZoneId.of("America/Lima")).toString()
@@ -51,12 +52,24 @@ data class AppState(
     val form: PersonDraft? = null,
     val detail: Person? = null,
     val attendanceDetail: Attendance? = null,
+    val markingReceipt: MarkingResult? = null,
     val activity: String? = null,
     val zoneCheck: ZoneCheck? = null,
     val calibrationOpen: Boolean = false,
     val trialSummary: TrialSummary = TrialSummary(),
-    val trialResult: FaceTestResult? = null
-)
+    val trialResult: FaceTestResult? = null,
+    val session: AccessSession? = null,
+    val accessStatus: AccessStatus = AccessStatus(),
+    val publicZone: PublicZone = PublicZone(),
+    val ownProfile: Person? = null,
+    val guestAttendance: Boolean = false,
+    val setupOpen: Boolean = false
+) {
+    val isAdministrator get() = session?.role == AccessRole.ADMINISTRADOR
+    val zoneConfigured get() = if (isAdministrator) site.latitude != null && site.longitude != null else publicZone.configured
+    val zoneName get() = if (isAdministrator) site.name else publicZone.name
+    val zoneRadius get() = if (isAdministrator) site.radius else publicZone.radius
+}
 
 class AppViewModel(val repository: AttendanceRepository) : ViewModel() {
     private val mutable = MutableStateFlow(AppState())
@@ -81,44 +94,106 @@ class AppViewModel(val repository: AttendanceRepository) : ViewModel() {
             throw e
         } catch (e: Exception) {
             if(e is AppFailure && e.code == "RETO_VENCIDO") draft { it.copy(fingerprint = null, tab = 1) }
-            error(if (e is AppFailure) e.message.orEmpty() else "No se pudo completar la operación. Intenta nuevamente.")
+            if (!handleExpiredSession(e)) error(if (e is AppFailure) e.message.orEmpty() else "No se pudo completar la operación. Intenta nuevamente.")
         } finally {
             change { it.copy(loading = false, activity = null) }
         }
     }
 
     suspend fun refresh() {
+        expireLocalSession()
         val request=++generation
         val date=if(mutable.value.followToday)attendanceToday() else mutable.value.attendanceDate
         try {
-            val site = repository.site()
-            val people = repository.people()
-            val list = repository.attendance(date)
-            if(request==generation)applySnapshot(site, people, list,date)
+            loadSnapshot(request, date, allowLoading = true)
         } catch(e: CancellationException){throw e}
-        catch(e: Exception){if(request==generation)change {it.copy(syncUnavailable=true)};throw e}
+        catch(e: Exception){if(request==generation && !handleExpiredSession(e))change {it.copy(syncUnavailable=true)};throw e}
     }
 
     suspend fun synchronize() {
         if (mutable.value.loading) return
+        expireLocalSession()
         val started = generation
         val date=if(mutable.value.followToday)attendanceToday() else mutable.value.attendanceDate
         try {
-            val site = repository.site()
-            val people = repository.people()
-            val list = repository.attendance(date)
-            if (started == generation && !mutable.value.loading) applySnapshot(site, people, list,date)
+            loadSnapshot(started, date, allowLoading = false)
         } catch (e: CancellationException) { throw e }
-        catch (_: Exception) {if(started==generation&&!mutable.value.loading)change {it.copy(syncUnavailable=true)}}
+        catch (e: Exception) {
+            if (started == generation && !mutable.value.loading && !handleExpiredSession(e)) change { it.copy(syncUnavailable = true) }
+        }
     }
 
-    private fun applySnapshot(site: Site, people: List<Person>, list: List<Attendance>,date: String) {
-        change { state -> state.copy(site = site, people = people, attendance = list,attendanceDate=date,attendanceError=null,syncUnavailable=false,zoneCheck=if(state.site==site)state.zoneCheck else null,
-            attendanceDetail=state.attendanceDetail?.let {selected->list.find {if(selected.id>0)it.id==selected.id else it.dni==selected.dni&&it.instant==selected.instant}},
-            detail = state.detail?.let { selected -> people.find { it.dni == selected.dni } }) }
+    private suspend fun loadSnapshot(request: Long, date: String, allowLoading: Boolean) {
+        val session = mutable.value.session
+        val zone = repository.publicZone()
+        val status = repository.accessStatus()
+        if (request != generation || (!allowLoading && mutable.value.loading)) return
+        if (session == null) {
+            change { it.copy(publicZone = zone, accessStatus = status, syncUnavailable = false) }
+            return
+        }
+        val admin = session.role == AccessRole.ADMINISTRADOR
+        val site = if (admin) repository.site() else Site()
+        val people = if (admin) repository.people() else emptyList()
+        val profile = if (admin) null else repository.ownProfile()
+        val list = repository.attendance(date)
+        if (request != generation || (!allowLoading && mutable.value.loading)) return
+        change { state ->
+            state.copy(site = site, publicZone = zone, accessStatus = status, people = people, ownProfile = profile,
+                attendance = list, attendanceDate = date, attendanceError = null, syncUnavailable = false,
+                zoneCheck = if (state.site == site) state.zoneCheck else null,
+                attendanceDetail = state.attendanceDetail?.let { selected ->
+                    list.find { if (selected.id > 0) it.id == selected.id else it.dni == selected.dni && it.instant == selected.instant }
+                }, detail = state.detail?.let { selected -> people.find { it.dni == selected.dni } })
+        }
+    }
+
+    fun startSession(session: AccessSession, profile: Person? = null) {
+        generation++
+        change { AppState(page = if (session.role == AccessRole.ADMINISTRADOR) 0 else 3,
+            loading = it.loading, session = session, ownProfile = profile, publicZone = it.publicZone,
+            accessStatus = it.accessStatus) }
+    }
+
+    fun closeReceipt() {
+        repository.discardReceipt()
+        change { it.copy(markingReceipt = null) }
+    }
+
+    fun openReceiptProfile() {
+        val receipt = mutable.value.markingReceipt?.personalAccess ?: return
+        repository.activateReceipt(receipt)
+        startSession(receipt.session, receipt.profile)
+    }
+
+    fun endSession() {
+        repository.clearSession()
+        generation++
+        change { AppState(loading = it.loading, publicZone = it.publicZone, accessStatus = it.accessStatus,
+            guestAttendance = it.session?.role == AccessRole.PERSONA) }
+    }
+
+    private fun expireLocalSession() {
+        if (mutable.value.markingReceipt?.personalAccess?.session?.expiresAt?.let { !Instant.now().isBefore(it) } == true) {
+            closeReceipt()
+        }
+        if (mutable.value.session?.expiresAt?.let { !Instant.now().isBefore(it) } == true) {
+            val wasPersonal = mutable.value.session?.role == AccessRole.PERSONA
+            endSession()
+            if (!wasPersonal) error("La sesión venció. Inicia sesión para continuar.")
+        }
+    }
+
+    private fun handleExpiredSession(error: Exception): Boolean {
+        if (error !is AppFailure || error.code != "SESION_REQUERIDA" || mutable.value.session == null) return false
+        val wasPersonal = mutable.value.session?.role == AccessRole.PERSONA
+        endSession()
+        if (!wasPersonal) this.error("La sesión terminó. Inicia sesión para continuar.")
+        return true
     }
 
     suspend fun selectAttendanceDate(date: String) {
+        if (mutable.value.session == null) throw AppFailure("Inicia sesión para consultar el historial.")
         val parsed=runCatching {LocalDate.parse(date)}.getOrNull() ?: throw AppFailure("Selecciona una fecha válida.")
         if(parsed>LocalDate.parse(attendanceToday()))throw AppFailure("Selecciona hoy o un día anterior.")
         val request=++generation
@@ -171,6 +246,11 @@ class AppViewModel(val repository: AttendanceRepository) : ViewModel() {
     suspend fun savePerson(): String {
         val form = mutable.value.form ?: throw AppFailure("Abre la ficha de la persona.")
         form.dataError?.let {throw AppFailure(it)}
+        if (mutable.value.session?.role == AccessRole.PERSONA) {
+            val saved = repository.saveOwnProfile(form.payload())
+            change { it.copy(form = null, ownProfile = saved) }
+            return "Ficha actualizada."
+        }
         val saved = repository.save(form.payload())
         change { state -> state.copy(form = null,
             people = (state.people.filterNot { it.dni == saved.dni } + saved).sortedBy { it.name },

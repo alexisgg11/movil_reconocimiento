@@ -9,8 +9,11 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.io.IOException
+import java.time.Instant
 
 class HttpAttendanceRepository : AttendanceRepository {
+    @Volatile private var sessionToken: String? = null
+    private var pendingReceipt: Pair<AccessSession, String>? = null
     private val base = if (Build.FINGERPRINT.contains("generic") || Build.MODEL.contains("Emulator") || Build.HARDWARE.contains("ranchu"))
         "http://10.0.2.2:8082/api" else "http://127.0.0.1:8082/api"
 
@@ -23,6 +26,7 @@ class HttpAttendanceRepository : AttendanceRepository {
             connection.readTimeout = 20000
             connection.setRequestProperty("Accept", "*/*")
             connection.setRequestProperty("Cache-Control", "no-cache")
+            sessionToken?.let { connection.setRequestProperty("Authorization", "Bearer $it") }
             if (body != null) {
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
@@ -43,6 +47,74 @@ class HttpAttendanceRepository : AttendanceRepository {
     private fun site(j: JSONObject) = Site(j.getString("nombre"), if(j.isNull("latitud")) null else j.getDouble("latitud"), if(j.isNull("longitud")) null else j.getDouble("longitud"), j.getDouble("radio"), j.optString("red"), j.getDouble("umbral"), j.getLong("revision"),j.optString("version"))
     private fun attendance(j: JSONObject) = Attendance(j.getString("nombre"), j.getString("dni"), j.getString("instante"), j.getString("metodo"), j.getDouble("distancia"), if(j.isNull("similitud")) null else j.getDouble("similitud"),j.getLong("id"),j.optString("foto"),j.optString("fotoRegistro"),if(j.isNull("umbral")) null else j.getDouble("umbral"),j.optDouble("precision"),j.optString("ip"),j.optString("tipoFotoRegistro","FICHA"))
     private fun vector(v: FloatArray) = JSONArray(v.map { it.toDouble() })
+    private fun challengeFrom(json: JSONObject) = Challenge(
+        json.getString("id"), json.getString("nonce"), json.getString("proposito"),
+        json.optString("dni", ""), json.optString("nombre", ""), json.optBoolean("requiereRostro", false)
+    )
+
+    override suspend fun accessStatus(): AccessStatus {
+        val result = JSONObject(request("/acceso/estado"))
+        return AccessStatus(result.getBoolean("administradorCreado"), result.getBoolean("preparacionDisponible"))
+    }
+
+    override suspend fun publicZone(): PublicZone {
+        val result = JSONObject(request("/asistencia/zona"))
+        return PublicZone(result.getString("nombre"), result.getDouble("radio"), result.getBoolean("configurada"))
+    }
+
+    override suspend fun loginChallenge(method: AccessMethod, publicKey: String): Challenge {
+        val payload = JSONObject().put("metodo", method.name).put("clave", publicKey)
+        return challengeFrom(JSONObject(request("/acceso/retos", "POST", payload)))
+    }
+
+    override suspend fun login(challenge: Challenge, signature: String?, capture: FaceCapture?): AccessSession {
+        val payload = JSONObject().put("reto", challenge.id).put("firma", signature)
+        capture?.let { payload.put("modelo", FACE_MODEL).put("vector", vector(it.average())) }
+        return openAdministrator(JSONObject(request("/acceso/sesion", "POST", payload)))
+    }
+
+    override suspend fun loginWithCredentials(username: String, password: String): AccessSession {
+        val payload = JSONObject().put("usuario", username).put("contrasena", password)
+        return openAdministrator(JSONObject(request("/acceso/credenciales", "POST", payload)))
+    }
+
+    private fun session(result: JSONObject) = AccessSession(result.getString("dni"),
+        AccessRole.valueOf(result.getString("rol")), Instant.parse(result.getString("vence")))
+
+    private fun openAdministrator(result: JSONObject): AccessSession {
+        val session = session(result)
+        if (session.role != AccessRole.ADMINISTRADOR) throw AppFailure("No se pudo iniciar la sesión de administrador.")
+        discardReceipt()
+        sessionToken = result.getString("token")
+        return session
+    }
+
+    override suspend fun logout() {
+        try { request("/acceso/sesion", "DELETE") } finally { clearSession() }
+    }
+
+    override fun clearSession() { sessionToken = null; discardReceipt() }
+
+    override suspend fun ownProfile() = person(JSONObject(request("/mi-ficha")))
+
+    override suspend fun saveOwnProfile(change: PersonChange): Person {
+        val payload = JSONObject().put("nombre", change.name).put("foto", change.photo)
+            .put("version", change.original?.version)
+        return person(JSONObject(request("/mi-ficha", "PUT", payload)))
+    }
+
+    override suspend fun initialFingerprint(code: String, dni: String, publicKey: String): Challenge {
+        val payload = JSONObject().put("codigo", code).put("dni", dni).put("clave", publicKey)
+        return challengeFrom(JSONObject(request("/acceso/preparacion/reto", "POST", payload)))
+    }
+
+    override suspend fun prepareAdministrator(code: String, dni: String, deviceKey: String, enrollment: PersonChange?,
+                                              username: String, password: String) {
+        val payload = JSONObject().put("codigo", code).put("dni", dni).put("claveDispositivo", deviceKey)
+            .put("registro", enrollment?.let(PersonPayloads::save))
+            .put("credenciales", JSONObject().put("usuario", username).put("contrasena", password))
+        request("/acceso/preparacion", "POST", payload)
+    }
     override suspend fun people(): List<Person> { val a=JSONArray(request("/personas")); return List(a.length()) { person(a.getJSONObject(it)) } }
     override suspend fun ensureDniAvailable(dni: String) { request("/personas/$dni/disponibilidad") }
     override suspend fun validateFaceEnrollment(change: PersonChange) {
@@ -91,8 +163,37 @@ class HttpAttendanceRepository : AttendanceRepository {
         request("/dispositivos/vincular","POST",JSONObject().put("reto",challenge.id).put("firma",signature).put("modelo",FACE_MODEL).put("vector",vector(capture.average())))
     }
     override suspend fun mark(challenge: Challenge, signature: String?, capture: FaceCapture?): Attendance {
-        val j=JSONObject().put("reto",challenge.id).put("firma",signature)
-        capture?.let { j.put("modelo",FACE_MODEL).put("vector",vector(it.average())).put("foto",it.photo) }
-        return attendance(JSONObject(request("/asistencias","POST",j)))
+        return attendance(JSONObject(request("/asistencias", "POST", markingPayload(challenge, signature, capture))))
+    }
+
+    override suspend fun markForResult(challenge: Challenge, signature: String?, capture: FaceCapture?): MarkingResult {
+        if (sessionToken != null) return MarkingResult(mark(challenge, signature, capture))
+        discardReceipt()
+        val result = JSONObject(request("/asistencias/recibo", "POST", markingPayload(challenge, signature, capture)))
+        val record = attendance(result.getJSONObject("asistencia"))
+        val profile = person(result.getJSONObject("persona"))
+        val credentials = result.getJSONObject("sesion")
+        val session = session(credentials)
+        if (session.role != AccessRole.PERSONA || session.dni != record.dni || session.dni != profile.dni) {
+            throw AppFailure("No se pudo verificar la ficha de esta marcación.")
+        }
+        pendingReceipt = session to credentials.getString("token")
+        return MarkingResult(record, PersonalAccess(profile, session, result.getBoolean("yaMarcada")))
+    }
+
+    override fun activateReceipt(access: PersonalAccess) {
+        val receipt = pendingReceipt
+        discardReceipt()
+        if (receipt == null || receipt.first !== access.session || sessionToken != null ||
+            !Instant.now().isBefore(access.session.expiresAt)) throw AppFailure("La verificación venció. Vuelve a marcar.")
+        sessionToken = receipt.second
+    }
+
+    override fun discardReceipt() { pendingReceipt = null }
+
+    private fun markingPayload(challenge: Challenge, signature: String?, capture: FaceCapture?): JSONObject {
+        val payload = JSONObject().put("reto", challenge.id).put("firma", signature)
+        capture?.let { payload.put("modelo", FACE_MODEL).put("vector", vector(it.average())).put("foto", it.photo) }
+        return payload
     }
 }

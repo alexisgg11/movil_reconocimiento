@@ -1,9 +1,12 @@
 package com.example.reconocimiento;
 
 import com.example.reconocimiento.application.AttendanceService;
+import com.example.reconocimiento.application.AccessService;
 import com.example.reconocimiento.application.VerificationService;
 import com.example.reconocimiento.domain.*;
+import com.example.reconocimiento.domain.AccessModels.Principal;
 import static com.example.reconocimiento.domain.Models.*;
+import static com.example.reconocimiento.domain.AccessModels.*;
 import static org.junit.jupiter.api.Assertions.*;
 import org.junit.jupiter.api.*;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,11 +24,12 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import io.github.cdimascio.dotenv.Dotenv;
 import org.springframework.web.context.WebApplicationContext;
+import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-@SpringBootTest(properties={"spring.datasource.url=jdbc:h2:mem:attendance;MODE=PostgreSQL;DB_CLOSE_DELAY=-1","spring.datasource.username=sa","spring.datasource.password="})
+@SpringBootTest(properties={"spring.datasource.url=jdbc:h2:mem:attendance;MODE=PostgreSQL;DB_CLOSE_DELAY=-1","spring.datasource.username=sa","spring.datasource.password=","ADMIN_SETUP_CODE="+AttendanceIntegrationTest.SETUP_CODE})
 @Import(AttendanceIntegrationTest.TimeConfiguration.class)
 class AttendanceIntegrationTest {
     @DynamicPropertySource static void database(DynamicPropertyRegistry registry){
@@ -37,6 +41,7 @@ class AttendanceIntegrationTest {
         }
     }
     @Autowired AttendanceService service;
+    @Autowired AccessService access;
     @Autowired VerificationService verification;
     @Autowired JdbcTemplate db;
     @Autowired MutableClock clock;
@@ -50,15 +55,168 @@ class AttendanceIntegrationTest {
         public Instant instant(){return value;}
     }
     static final String IP="127.0.0.1";
+    static final String SETUP_CODE="0123456789abcdef0123456789abcdef";
+    private static final Credentials ADMIN_CREDENTIALS = new Credentials("operador.qa", "frase de acceso para pruebas");
     @BeforeEach void reset(){
         clock.value=Instant.parse("2026-11-01T04:59:50Z");
         clock.advanceOnZone=false;
-        for(String table:List.of("ensayo_facial","asistencia","reto","dispositivo","rostro","persona"))db.update("DELETE FROM reconocimiento."+table);
+        for(String table:List.of("sesion","usuario","ensayo_facial","asistencia","reto","dispositivo","rostro","persona"))db.update("DELETE FROM reconocimiento."+table);
         service.configure(new Configuration("Sede",0d,0d,100,"",.8,0));
         service.register(new Enrollment("12345678","Ana Pérez","",MODEL,List.of(RulesTest.face(0),RulesTest.face(0),RulesTest.face(0))));
     }
     Challenge faceChallenge(){return service.challenge(new ChallengeRequest("FACIAL",null,null,new Position(0,0,5,0,false)),IP);}
     Proof faceProof(Challenge c){return new Proof(c.id(),null,MODEL,RulesTest.face(0));}
+
+    private MockMvc adminHttp() throws Exception {
+        String dni = "00000001";
+        String token = "A".repeat(43);
+        String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(token.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        db.update("INSERT INTO reconocimiento.persona(dni,nombre) VALUES(?,?)", dni, "Operador de pruebas");
+        db.update("INSERT INTO reconocimiento.usuario(id,dni,rol,clave_dispositivo) VALUES(1,?,'ADMINISTRADOR','fixture')", dni);
+        db.update("INSERT INTO reconocimiento.sesion(token_hash,dni,rol,vence) VALUES(?,?,'ADMINISTRADOR',?)",
+                hash, dni, java.sql.Timestamp.from(clock.instant().plusSeconds(900)));
+        return MockMvcBuilders.webAppContextSetup(web).defaultRequest(get("/").header("Authorization", "Bearer " + token)).build();
+    }
+
+    @Test void guestCanMarkButCannotReadPeopleHistoryOrConfiguration() throws Exception {
+        var http = MockMvcBuilders.webAppContextSetup(web).build();
+        for (String path : List.of("/api/personas", "/api/configuracion", "/api/asistencias", "/api/asistencias/reporte.xlsx", "/api/mi-ficha")) {
+            http.perform(get(path)).andExpect(status().isUnauthorized());
+        }
+        http.perform(post("/api/retos").contentType("application/json")
+                .content("""
+                        {"proposito":"ALTA_HUELLA","dni":"87654321"}
+                        """)).andExpect(status().isUnauthorized());
+        http.perform(get("/api/asistencia/zona")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.configurada").value(true)).andExpect(jsonPath("$.latitud").doesNotExist());
+        var mark = faceChallenge();
+        http.perform(post("/api/asistencias").contentType("application/json")
+                .content("{\"reto\":\"" + mark.id() + "\",\"modelo\":\"" + MODEL + "\",\"vector\":" + Arrays.toString(RulesTest.face(0)) + "}"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.dni").value("12345678"));
+    }
+
+    @Test void administratorFaceRequiresSetupAndTheAuthorizedDevice() throws Exception {
+        var http = MockMvcBuilders.webAppContextSetup(web).build();
+        var device = keys();
+        var setup = new InitialAdministrator(SETUP_CODE, "12345678", publicKey(device), null, ADMIN_CREDENTIALS);
+        assertThrows(RuleViolation.class, () -> access.prepareAdministrator(
+                new InitialAdministrator("invalido", setup.dni(), setup.claveDispositivo(), null, ADMIN_CREDENTIALS), IP));
+        http.perform(post("/api/acceso/preparacion").contentType("application/json").content("""
+                {"codigo":"%s","dni":"%s","claveDispositivo":"%s","credenciales":{"usuario":"%s","contrasena":"%s"}}
+                """.formatted(setup.codigo(), setup.dni(), setup.claveDispositivo(),
+                        ADMIN_CREDENTIALS.usuario(), ADMIN_CREDENTIALS.contrasena()))).andExpect(status().isNoContent());
+        assertEquals(1, db.queryForObject("SELECT COUNT(*) FROM reconocimiento.usuario", Integer.class));
+        assertThrows(RuleViolation.class, () -> access.prepareAdministrator(
+                new InitialAdministrator(SETUP_CODE, "87654321", publicKey(device), null, ADMIN_CREDENTIALS), IP));
+        assertThrows(RuleViolation.class, () -> access.challenge(new LoginRequest(Method.ROSTRO, publicKey(keys())), IP));
+        var request = new LoginRequest(Method.ROSTRO, publicKey(device));
+        var rejected = access.challenge(request, IP);
+        assertThrows(RuleViolation.class, () -> access.login(new Proof(rejected.id(), null, MODEL, RulesTest.face(0)), IP));
+        assertThrows(RuleViolation.class, () -> access.login(new Proof(rejected.id(), sign(rejected, device), MODEL, RulesTest.face(0)), IP));
+        var challengeBody = http.perform(post("/api/acceso/retos").contentType("application/json").content("""
+                {"metodo":"ROSTRO","clave":"%s"}
+                """.formatted(setup.claveDispositivo()))).andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        var parsed = com.jayway.jsonpath.JsonPath.parse(challengeBody);
+        var challenge = new Challenge(parsed.read("$.id"), parsed.read("$.nonce"), parsed.read("$.proposito"),
+                setup.dni(), setup.claveDispositivo(), clock.instant(), null, IP, 0);
+        var proof = new Proof(challenge.id(), sign(challenge, device), MODEL, RulesTest.face(0));
+        String sessionBody = http.perform(post("/api/acceso/sesion").contentType("application/json").content("""
+                {"reto":"%s","firma":"%s","modelo":"%s","vector":%s}
+                """.formatted(proof.reto(), proof.firma(), proof.modelo(), Arrays.toString(proof.vector()))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.rol").value("ADMINISTRADOR"))
+                .andExpect(jsonPath("$.vence").isString()).andReturn().getResponse().getContentAsString();
+        assertThrows(RuleViolation.class, () -> access.login(proof, IP));
+        String header = "Bearer " + com.jayway.jsonpath.JsonPath.read(sessionBody, "$.token");
+        http.perform(get("/api/personas").header("Authorization", header)).andExpect(status().isOk());
+        http.perform(get("/api/configuracion").header("Authorization", header)).andExpect(status().isOk());
+        http.perform(delete("/api/personas/12345678").header("Authorization", header))
+                .andExpect(status().isUnprocessableContent()).andExpect(jsonPath("$.codigo").value("ADMINISTRADOR_ACTIVO"));
+        http.perform(delete("/api/acceso/sesion").header("Authorization", header)).andExpect(status().isNoContent());
+        http.perform(get("/api/personas").header("Authorization", header)).andExpect(status().isUnauthorized());
+    }
+
+    @Test void fingerprintOnlyAdministratorCanBeCreatedAndSignIn() throws Exception {
+        db.update("UPDATE reconocimiento.configuracion SET latitud=NULL,longitud=NULL WHERE id=1");
+        var fingerprint = keys();
+        var trustedDevice = keys();
+        String dni = "87654321";
+        var pending = access.initialFingerprint(new InitialChallenge(SETUP_CODE, dni, publicKey(fingerprint)), IP);
+        var enrollment = new Enrollment(dni, "Persona de prueba", "", null, null, new Proof(pending.id(), sign(pending, fingerprint), null, null));
+        access.prepareAdministrator(new InitialAdministrator(SETUP_CODE, dni, publicKey(trustedDevice), enrollment, ADMIN_CREDENTIALS), IP);
+        var challenge = access.challenge(new LoginRequest(Method.HUELLA, publicKey(fingerprint)), IP);
+        var session = access.login(new Proof(challenge.id(), sign(challenge, fingerprint), null, null), IP);
+        assertEquals(Role.ADMINISTRADOR, session.rol());
+        assertEquals("BIOMETRIA_REQUERIDA", assertThrows(RuleViolation.class, () -> service.unbindPerson(dni)).code);
+        assertEquals(dni, service.device(publicKey(fingerprint)).dni());
+        clock.value = session.vence();
+        assertEquals(401, assertThrows(RuleViolation.class, () -> access.requireSession("Bearer " + session.token())).status);
+    }
+
+    @Test void migratedAdministratorCanSetCredentialsAndSignInWithoutDni() throws Exception {
+        var http = MockMvcBuilders.webAppContextSetup(web).build();
+        String deviceKey = publicKey(keys());
+        db.update("INSERT INTO reconocimiento.usuario(id,dni,rol,clave_dispositivo) VALUES(1,?,'ADMINISTRADOR',?)",
+                "12345678", deviceKey);
+        access.prepareAdministrator(new InitialAdministrator(SETUP_CODE, "12345678", deviceKey, null, ADMIN_CREDENTIALS), IP);
+        String hash = db.queryForObject("SELECT clave_hash FROM reconocimiento.usuario", String.class);
+        assertTrue(hash.startsWith("pbkdf2-sha256$600000$"));
+        assertFalse(hash.contains(ADMIN_CREDENTIALS.contrasena()));
+        String path = "/api/acceso/credenciales";
+        http.perform(post(path).contentType("application/json").content("""
+                {"usuario":"operador.qa","contrasena":"incorrecta"}
+                """)).andExpect(status().isUnauthorized()).andExpect(jsonPath("$.codigo").value("CREDENCIALES_INVALIDAS"));
+        String body = http.perform(post(path).contentType("application/json").content("""
+                {"usuario":"OPERADOR.QA","contrasena":"%s"}
+                """.formatted(ADMIN_CREDENTIALS.contrasena())))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.rol").value("ADMINISTRADOR"))
+                .andReturn().getResponse().getContentAsString();
+        String header = "Bearer " + com.jayway.jsonpath.JsonPath.read(body, "$.token");
+        http.perform(get("/api/personas").header("Authorization", header)).andExpect(status().isOk());
+        assertTrue(service.attendance(null).isEmpty());
+        access.prepareAdministrator(new InitialAdministrator(SETUP_CODE, "12345678", deviceKey, null, ADMIN_CREDENTIALS), IP);
+        assertNotEquals(hash, db.queryForObject("SELECT clave_hash FROM reconocimiento.usuario", String.class));
+        http.perform(get("/api/personas").header("Authorization", header)).andExpect(status().isUnauthorized());
+    }
+
+    @Test void personalSessionCanOnlyReadAndChangeItsOwnRecord() throws Exception {
+        var http = MockMvcBuilders.webAppContextSetup(web).build();
+        service.register(new Enrollment("87654321", "Otra persona", "", MODEL,
+                List.of(RulesTest.face(1), RulesTest.face(1), RulesTest.face(1))));
+        service.mark(new Proof(faceChallenge().id(), null, MODEL, RulesTest.face(1)), IP);
+        var challenge = faceChallenge();
+        var proof = faceProof(challenge);
+        assertThrows(RuleViolation.class, () -> access.login(proof, IP));
+        String receipt = http.perform(post("/api/asistencias/recibo").contentType("application/json").content("""
+                {"reto":"%s","modelo":"%s","vector":%s}
+                """.formatted(proof.reto(), MODEL, Arrays.toString(proof.vector()))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.persona.dni").value("12345678"))
+                .andExpect(jsonPath("$.yaMarcada").value(false)).andExpect(jsonPath("$.sesion.rol").value("PERSONA"))
+                .andReturn().getResponse().getContentAsString();
+        assertThrows(RuleViolation.class, () -> access.markReceipt(proof, IP));
+        var duplicate = access.markReceipt(faceProof(faceChallenge()), IP);
+        assertTrue(duplicate.yaMarcada());
+        assertEquals(1, service.attendance(null, "12345678").size());
+        var session = duplicate.sesion();
+        String header = "Bearer " + session.token();
+        assertNotEquals(com.jayway.jsonpath.JsonPath.read(receipt, "$.sesion.token"), session.token());
+        for (String path : List.of("/api/personas", "/api/configuracion", "/api/asistencias/reporte.xlsx")) {
+            http.perform(get(path).header("Authorization", header)).andExpect(status().isForbidden());
+        }
+        http.perform(get("/api/mi-ficha").header("Authorization", header)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.dni").value("12345678"));
+        http.perform(get("/api/asistencias").param("dni", "87654321").header("Authorization", header))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].dni").value("12345678"));
+        String version = access.profile(new Principal(session.dni(), session.rol())).version();
+        String data = "{\"nombre\":\"Ana María Pérez\",\"version\":\"" + version + "\"}";
+        http.perform(put("/api/mi-ficha").header("Authorization", header).contentType("application/json")
+                .content(data.replace("{", "{\"dni\":\"87654321\","))).andExpect(status().isBadRequest());
+        http.perform(put("/api/mi-ficha").header("Authorization", header).contentType("application/json").content(data))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.nombre").value("Ana María Pérez"));
+        assertEquals("Otra persona", db.queryForObject("SELECT nombre FROM reconocimiento.persona WHERE dni='87654321'", String.class));
+        service.remove(session.dni());
+        http.perform(get("/api/mi-ficha").header("Authorization", header)).andExpect(status().isUnauthorized());
+    }
     @Test void facialAttendanceIsUniqueAndChallengeCannotBeReused(){
         Challenge c=faceChallenge();assertEquals("12345678",service.mark(faceProof(c),IP).dni());
         assertThrows(RuleViolation.class,()->service.mark(faceProof(c),IP));
@@ -198,7 +356,7 @@ class AttendanceIntegrationTest {
         clock.value=Instant.parse("2026-11-01T14:20:00Z");
         service.mark(faceProof(faceChallenge()),IP);
         service.remove("12345678");
-        var mvc=MockMvcBuilders.webAppContextSetup(web).build();
+        var mvc=adminHttp();
         mvc.perform(get("/api/asistencias/reporte")).andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(2))
             .andExpect(jsonPath("$[0].fecha").value("2026-11-01")).andExpect(jsonPath("$[0].nombre").value("Ana Pérez"))
             .andExpect(jsonPath("$[0].foto").value("")).andExpect(jsonPath("$[0].fotoRegistro").value(""));
@@ -213,7 +371,7 @@ class AttendanceIntegrationTest {
         assertEquals(2,db.queryForObject("SELECT COUNT(*) FROM reconocimiento.asistencia",Integer.class));
     }
     @Test void reportRejectsIncompleteReversedOrFuturePeriods()throws Exception{
-        var mvc=MockMvcBuilders.webAppContextSetup(web).build();
+        var mvc=adminHttp();
         for(String[] period:List.of(new String[]{"2026-10-31",""},new String[]{"2026-10-31","2026-10-30"},new String[]{"2026-10-31","2026-11-01"})){
             var request=get("/api/asistencias/reporte.xlsx").param("desde",period[0]);
             if(!period[1].isEmpty())request.param("hasta",period[1]);
@@ -290,7 +448,7 @@ class AttendanceIntegrationTest {
     @Test void historicalAttendanceIsQueriedByLimaDateThroughHttpAndSurvivesDeletion()throws Exception{
         service.mark(faceProof(faceChallenge()),IP);clock.value=clock.value.plusSeconds(12);
         service.mark(faceProof(faceChallenge()),IP);service.remove("12345678");
-        var http=MockMvcBuilders.webAppContextSetup(web).build();
+        var http=adminHttp();
         http.perform(get("/api/asistencias").param("fecha","2026-10-31"))
             .andExpect(status().isOk()).andExpect(jsonPath("$.length()").value(1)).andExpect(jsonPath("$[0].fecha").value("2026-10-31")).andExpect(jsonPath("$[0].nombre").value("Ana Pérez"));
         http.perform(get("/api/asistencias").param("fecha","2026-11-01"))
@@ -308,7 +466,7 @@ class AttendanceIntegrationTest {
         assertEquals(marked.instante(),service.attendance(marked.fecha()).getFirst().instante());
     }
     @Test void personCrudRoundTripPersistsBiometricsAndReadsSqlChangesThroughHttp()throws Exception{
-        var http=MockMvcBuilders.webAppContextSetup(web).build();KeyPair key=keys();String photo=samplePhoto();
+        var http=adminHttp();KeyPair key=keys();String photo=samplePhoto();
         Challenge pending=service.challenge(new ChallengeRequest("ALTA_HUELLA","87654321",publicKey(key),null),IP);
         String vector=Arrays.toString(RulesTest.face(1));
         String create="""
@@ -338,13 +496,13 @@ class AttendanceIntegrationTest {
     }
     KeyPair keys()throws Exception{KeyPairGenerator generator=KeyPairGenerator.getInstance("EC");generator.initialize(256);return generator.generateKeyPair();}
     @Test void dniAvailabilityChecksActiveAndDeletedRecordsWithoutCreatingAnything()throws Exception{
-        var http=MockMvcBuilders.webAppContextSetup(web).build();
+        var http=adminHttp();
         http.perform(get("/api/personas/87654321/disponibilidad")).andExpect(status().isOk()).andExpect(jsonPath("$.disponible").value(true));
         http.perform(get("/api/personas/12345678/disponibilidad")).andExpect(status().isUnprocessableEntity()).andExpect(jsonPath("$.codigo").value("DNI_DUPLICADO"));
         service.remove("12345678");
         http.perform(get("/api/personas/12345678/disponibilidad")).andExpect(status().isUnprocessableEntity());
         http.perform(get("/api/personas/abc/disponibilidad")).andExpect(status().isUnprocessableEntity()).andExpect(jsonPath("$.codigo").value("DNI_INVALIDO"));
-        assertEquals(1,db.queryForObject("SELECT COUNT(*) FROM reconocimiento.persona",Integer.class));
+        assertEquals(2,db.queryForObject("SELECT COUNT(*) FROM reconocimiento.persona",Integer.class));
     }
     @Test void importedPhotoCreatesOneTemplateRecognizesAndCanBeReplaced()throws Exception{
         String photo=samplePhoto();
@@ -373,12 +531,12 @@ class AttendanceIntegrationTest {
         assertEquals("REVISION_REQUERIDA",assertThrows(RuleViolation.class,()->service.register(new Enrollment("87654321","Ingrid López",photo,MODEL,List.of(RulesTest.face(1)),null,photo,"GALERIA",false))).code);
         assertEquals("CAPTURAS_INSUFICIENTES",assertThrows(RuleViolation.class,()->service.register(new Enrollment("87654321","Ingrid López",photo,MODEL,List.of(RulesTest.face(1)),null,photo,"CAMARA",true))).code);
         assertEquals("ORIGEN_INVALIDO",assertThrows(RuleViolation.class,()->service.register(new Enrollment("87654321","Ingrid López",photo,MODEL,List.of(RulesTest.face(1)),null,photo,"OTRO",true))).code);
-        var http=MockMvcBuilders.webAppContextSetup(web).build();String vector=Arrays.toString(RulesTest.face(1));
+        var http=adminHttp();String vector=Arrays.toString(RulesTest.face(1));
         String preview="""
             {"registro":{"dni":"87654321","nombre":"Ingrid López","foto":"%s","fotoRostro":"%s","modelo":"%s","vectores":[%s],"origenRostro":"GALERIA","revisionVisual":true}}
             """.formatted(photo,photo,MODEL,vector);
         http.perform(post("/api/personas/validar").contentType("application/json").content(preview)).andExpect(status().isOk()).andExpect(jsonPath("$.valido").value(true));
-        assertEquals(1,service.people().size());assertEquals(3,db.queryForObject("SELECT COUNT(*) FROM reconocimiento.rostro",Integer.class));
+        assertEquals(2,service.people().size());assertEquals(3,db.queryForObject("SELECT COUNT(*) FROM reconocimiento.rostro",Integer.class));
         http.perform(post("/api/personas").contentType("application/json").content(preview.substring(preview.indexOf(":")+1,preview.lastIndexOf("}"))))
             .andExpect(status().isCreated()).andExpect(jsonPath("$.rostro").value(true)).andExpect(jsonPath("$.origenRostro").value("GALERIA"));
     }
@@ -387,7 +545,7 @@ class AttendanceIntegrationTest {
         String body="""
             {"registro":{"dni":"12345678","nombre":"Ana Pérez","foto":"%s","fotoRostro":"%s","modelo":"%s","vectores":[%s,%s,%s],"origenRostro":"CAMARA","revisionVisual":false,"version":"%s","eliminarHuella":false},"version":"%s"}
             """.formatted(photo,photo,MODEL,vector,vector,vector,p.version(),p.version());
-        var http=MockMvcBuilders.webAppContextSetup(web).build();
+        var http=adminHttp();
         http.perform(post("/api/personas/validar").contentType("application/json").content(body))
             .andExpect(status().isBadRequest()).andExpect(jsonPath("$.codigo").value("DATOS_INVALIDOS"));
         String fixed="""
